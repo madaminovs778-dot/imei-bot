@@ -1,123 +1,122 @@
-import io
-import re
 import os
-import easyocr
+import re
+import io
+import httpx
 import asyncio
-import logging
-import sqlite3
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-from aiogram.client.session.aiohttp import AiohttpSession
-from aiohttp import web
+import socket
+from datetime import datetime
+import pytz
+from aiogram import Bot, Dispatcher, types, executor
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
 
-# 1. SOZLAMALAR
-TOKEN = "8493482356:AAEM7VuQ30NhNTZBKE7HDt4SkyShv7rkwh0"
-logging.basicConfig(level=logging.INFO)
+# --- SOZLAMALAR (GitHub-da ochiq ko'rinmaydi) ---
+API_TOKEN = os.getenv('8493482356:AAEM7VuQ3ONhNTZBKE7HDt4SkyShv7rkwh0')
+STEIN_API_URL = os.getenv('https://api.steinhq.com/v1/storages/697d2b1caffba40a6243f4b9')
+OCR_API_KEY = os.getenv('K86744407688957')
 
-# Ma'lumotlar bazasi
-conn = sqlite3.connect('imei_base.db', check_same_thread=False)
-cursor = conn.cursor()
-cursor.execute('''CREATE TABLE IF NOT EXISTS imeis 
-                  (imei TEXT PRIMARY KEY, user TEXT, branch TEXT)''')
-conn.commit()
+# DNS muammosini tekshirish
+try:
+    print(f"Internet tekshiruvi (DNS): {socket.gethostbyname('api.telegram.org')}")
+except Exception as e:
+    print(f"⚠️ Tarmoq xatoligi: {e}")
 
-# 2. BOT OBYEKTLARI
-session = AiohttpSession()
-bot = Bot(token=TOKEN, session=session)
-dp = Dispatcher()
-reader = easyocr.Reader(['en'], gpu=False)
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher(bot, storage=MemoryStorage())
 
-# 3. FSM (Holatlar)
-class Registration(StatesGroup):
-    waiting_for_name = State()
-    waiting_for_branch = State()
+class BotStates(StatesGroup):
     waiting_for_photo = State()
+    waiting_for_branch = State()
 
-# 4. TUGMALAR
+BRANCHES = ["Texnomakon", "Salom nasiy", "Sar tex", "Uzun", "Corocus", "Mobile", "Termiz", "Amir xolding"]
+
+async def check_imei_exists(imei):
+    """Stein orqali bazada IMEI borligini tekshirish"""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            search_query = f'{{"IMEI1":"{imei}"}}'
+            response = await client.get(f"{STEIN_API_URL}?search={search_query}")
+            data = response.json()
+            return len(data) > 0
+        except Exception as e:
+            print(f"Qidiruv xatosi: {e}")
+            return False
+
 def get_branch_keyboard():
-    branches = [
-        [KeyboardButton(text="Texnomakon"), KeyboardButton(text="Salom nasiya")],
-        [KeyboardButton(text="Sar tex"), KeyboardButton(text="Uzun")],
-        [KeyboardButton(text="Crocus"), KeyboardButton(text="Mobile")],
-        [KeyboardButton(text="Termiz"), KeyboardButton(text="Amir xolding")]
-    ]
-    return ReplyKeyboardMarkup(keyboard=branches, resize_keyboard=True, one_time_keyboard=True)
+    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    for branch in BRANCHES:
+        keyboard.add(branch)
+    return keyboard
 
-# 5. DUBKLIKATNI TEKSHIRISH
-def check_and_save_imei(imei_list, user_name, branch_name):
-    results = []
-    for imei in imei_list:
-        cursor.execute("SELECT user, branch FROM imeis WHERE imei=?", (imei,))
-        row = cursor.fetchone()
-        if row:
-            results.append(f"⚠️ `{imei}` - **BAZADA BOR!**\n(Yuborgan: {row[0]}, Filial: {row[1]})")
-        else:
-            cursor.execute("INSERT INTO imeis (imei, user, branch) VALUES (?, ?, ?)", 
-                           (imei, user_name, branch_name))
-            conn.commit()
-            results.append(f"✅ `{imei}` - **YANGI (Saqlandi)**")
-    return results
+@dp.message_handler(commands=['start'], state='*')
+async def start_cmd(message: types.Message):
+    await message.answer("Xush kelibsiz! Iltimos, smartfon qutisidagi IMEI rasmini yuboring.")
+    await BotStates.waiting_for_photo.set()
 
-# 6. HANDLERLAR
-@dp.message(Command("start"))
-async def start_handler(message: types.Message, state: FSMContext):
-    await message.answer("Xush kelibsiz! Ism-familiyangizni kiriting:")
-    await state.set_state(Registration.waiting_for_name)
+@dp.message_handler(content_types=['photo'], state=BotStates.waiting_for_photo)
+async def handle_photo(message: types.Message, state: FSMContext):
+    photo = message.photo[-1]
+    file_info = await bot.get_file(photo.file_id)
+    file_url = f"https://api.telegram.org/file/bot{API_TOKEN}/{file_info.file_path}"
 
-@dp.message(Registration.waiting_for_name)
-async def process_name(message: types.Message, state: FSMContext):
-    await state.update_data(user_name=message.text)
-    await message.answer(f"Rahmat, {message.text}! Filialni tanlang:", reply_markup=get_branch_keyboard())
-    await state.set_state(Registration.waiting_for_branch)
+    await message.answer("⌛ Rasm skanerlanmoqda...")
 
-@dp.message(Registration.waiting_for_branch)
-async def process_branch(message: types.Message, state: FSMContext):
-    await state.update_data(branch_name=message.text)
-    await message.answer("Endi IMEI kodli rasmni yuboring:", reply_markup=types.ReplyKeyboardRemove())
-    await state.set_state(Registration.waiting_for_photo)
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        payload = {'apikey': OCR_API_KEY, 'url': file_url, 'language': 'eng', 'OCREngine': 2}
+        try:
+            res = await client.post("https://api.ocr.space/parse/image", data=payload)
+            result = res.json()
+            
+            if result.get("ParsedResults"):
+                text = result["ParsedResults"][0]["ParsedText"]
+                imeis = re.findall(r'\b\d{15}\b', text)
+                
+                if imeis:
+                    imei1 = imeis[0]
+                    if await check_imei_exists(imei1):
+                        await message.answer(f"❌ Xatolik: {imei1} bazada allaqachon mavjud!")
+                        return
 
-@dp.message(Registration.waiting_for_photo, F.photo)
-async def process_photo(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    msg = await message.answer("Skanerlanmoqda... 🔍")
-    try:
-        photo = message.photo[-1]
-        file_info = await bot.get_file(photo.file_id)
-        file_bytes = await bot.download_file(file_info.file_path)
-        
-        ocr_results = reader.readtext(file_bytes.read())
-        full_text = " ".join([res[1] for res in ocr_results])
-        imei_list = re.findall(r'\d{15}', full_text)
-        
-        if imei_list:
-            status_list = check_and_save_imei(imei_list, data['user_name'], data['branch_name'])
-            response = f"👤 **Xodim:** {data['user_name']}\n📍 **Filial:** {data['branch_name']}\n\n" + "\n\n".join(status_list)
-            await msg.edit_text(response, parse_mode="Markdown")
-        else:
-            await msg.edit_text("❌ Rasmda 15 xonali IMEI topilmadi.")
-    except Exception as e:
-        await msg.edit_text(f"⚠️ Xatolik: {str(e)}")
+                    await state.update_data(imei1=imei1, imei2=imeis[1] if len(imeis) > 1 else "Yo'q")
+                    await message.answer(f"✅ Skanerlandi:\nIMEI 1: {imei1}\n\nFilialni tanlang:", reply_markup=get_branch_keyboard())
+                    await BotStates.waiting_for_branch.set()
+                else:
+                    await message.answer("Rasmda IMEI topilmadi. Iltimos, aniqroq rasm yuboring.")
+            else:
+                await message.answer("Skanerlashda xatolik yuz berdi.")
+        except Exception:
+            await message.answer("OCR xizmati bilan bog'lanishda xatolik.")
 
-# 7. RENDER UCHUN PORT (WEB SERVER)
-async def handle(request):
-    return web.Response(text="Bot is running!")
+@dp.message_handler(state=BotStates.waiting_for_branch)
+async def handle_branch(message: types.Message, state: FSMContext):
+    if message.text not in BRANCHES:
+        await message.answer("Tugmalardan birini tanlang.")
+        return
 
-async def main():
-    # Render uchun vaqtinchalik HTTP server (o'chib qolmaslik uchun)
-    app = web.Application()
-    app.router.add_get("/", handle)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 10000)))
-    
-    # Botni ishga tushirish
-    loop = asyncio.get_event_loop()
-    loop.create_task(site.start())
-    print("Bot va Port ishga tushdi...")
-    await dp.start_polling(bot)
+    user_data = await state.get_data()
+    now = datetime.now(pytz.timezone('Asia/Tashkent'))
+    full_datetime = now.strftime("%d.%m.%Y %H:%M:%S")
 
-if __name__ == "__main__":
-    asyncio.run(main())
+    row = [{
+        "Sana_Vaqt": full_datetime,
+        "IMEI1": user_data['imei1'],
+        "IMEI2": user_data['imei2'],
+        "Filial": message.text,
+        "UserID": str(message.from_user.id),
+        "Ism": message.from_user.full_name
+    }]
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            response = await client.post(STEIN_API_URL, json=row)
+            if response.status_code == 200:
+                await message.answer(f"✅ Saqlandi!\nSana: {full_datetime}\nFilial: {message.text}", reply_markup=types.ReplyKeyboardRemove())
+                await BotStates.waiting_for_photo.set()
+            else:
+                await message.answer("Jadvalga saqlashda xatolik.")
+        except:
+            await message.answer("Stein API xatosi.")
+
+if __name__ == '__main__':
+    executor.start_polling(dp, skip_updates=True)
